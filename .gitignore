@@ -1,0 +1,7 @@
+# Created by the helper on each PC: personal download list and logs
+stremio-enhanced/strem-plus-helper/downloads.json
+stremio-enhanced/strem-plus-helper/downloads.json.tmp
+stremio-enhanced/strem-plus-helper/*.log
+node_modules/
+Thumbs.db
+desktop.ini
