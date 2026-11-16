@@ -16,6 +16,7 @@
 //   POST /dl/settings {autoDelete?, convertToMp4?, disabledTypes?} -> page settings (types turned off are
 //                                     hidden from the "📁 Downloaded" streams)
 //   POST /dl/format   {key, format} -> "original" keeps one download as is; "mp4"/"mov"/"mkv" converts it
+//   POST /dl/check                  -> check every MP4/MOV download's audio again and repair damage
 //   POST /dl/left     {videoId}     -> the player for that episode closed
 //   GET  /dl/browse?path=           -> folders inside path (drives + Videos/Downloads/Desktop if empty)
 //   POST /dl/set-folder {path}      -> set the download folder (must exist and be writable)
@@ -52,7 +53,7 @@ try { state = { ...state, ...JSON.parse(fs.readFileSync(STATE_FILE, "utf8").repl
 // A download that was running when the helper stopped resumes from its .part file.
 for (const it of Object.values(state.items)) {
   if (it.status === "downloading") it.status = "queued";
-  it.optimizing = false;                                   // a conversion cut off by a restart starts over
+  it.optimizing = false; it.repairing = false; it.checking = false; // work cut off by a restart starts over
   if (it.optimizedFile && !it.optimizedTo) it.optimizedTo = "mp4"; // made before other targets existed
 }
 
@@ -95,7 +96,8 @@ function publicItem(it) {
   // fileType: MKV/MP4/...; playback: how Stremio will play it (see "optimize for direct play").
   // playback: how Stremio will play it / what the converter is doing (see "convert for direct play").
   const t = targetOf(it);
-  const playback = it.optimizing ? "optimizing" : it.optimizedFile ? "swapping"
+  const playback = it.checking ? "checking" : it.repairing ? "repairing" : it.optimizedFile && it.optimizedRepair ? "repaired"
+    : it.optimizing ? "optimizing" : it.optimizedFile ? "swapping"
     : it.optimized === "failed" ? "failed" : it.optimized === "skipped" ? "converter"
     : FF && it.status === "done" && needsWork(it) ? "pending" : it.optimized === true ? "direct" : !t ? "kept" : "converter";
   const fileType = path.extname(it.file).slice(1).toUpperCase();
@@ -293,13 +295,64 @@ async function inspect(file) {
   return { video, audio: audio[0], direct };
 }
 
+// Stremio's player (Chromium) stops dead on a single damaged audio frame ("Error occurred when
+// decoding"), where most players just skip it. FFmpeg's built-in AAC encoder very occasionally writes
+// one, so every file we make is decoded once and its audio re-encoded if anything is wrong.
+// Resolves with the number of errors (0 = clean, -1 = couldn't run FFmpeg).
+function audioErrors(file) {
+  return new Promise((resolve) => {
+    const p = spawn(FF.ffmpeg, ["-hide_banner", "-nostdin", "-v", "error", "-i", file, "-map", "0:a?", "-f", "null", "-"], { windowsHide: true });
+    optChild = p;
+    let n = 0;
+    p.stderr.on("data", (d) => { n += (String(d).match(/error|invalid/gi) || []).length; });
+    p.on("error", () => resolve(-1));
+    p.on("close", (code) => resolve(code === 0 ? n : Math.max(n, 1)));
+  });
+}
+// Re-encode just the audio (the picture is copied as is), then check the result. Up to two tries.
+async function repairAudio(src, dst, mux) {
+  for (let i = 0; i < 2; i++) {
+    await run(FF.ffmpeg, ["-hide_banner", "-nostdin", "-y", "-v", "error", "-i", src, "-map", "0", "-c", "copy",
+      "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart", "-f", mux, dst], (p) => (optChild = p));
+    if ((await audioErrors(dst)) === 0) return true;
+  }
+  return false;
+}
+
+// Files already on disk: check each playable file's audio once, and repair it the same way. The
+// repaired copy is swapped in by swapOptimized(), so never while the player is reading the file.
+async function checkAudio(it) {
+  const ext = extOf(it.file);
+  it.checking = true; save();
+  const n = await audioErrors(it.file);
+  it.checking = false;
+  if (n < 0) { save(); return; }                            // FFmpeg couldn't run: try again later
+  it.audioChecked = true; save();
+  if (n === 0) return;
+  if (state.check) state.check.found++;
+  const tmp = `${it.file}.${process.pid}0.optimizing`;
+  it.optimizing = ext; it.repairing = true; save();
+  try {
+    if (await repairAudio(it.file, tmp, ext === "mov" ? "mov" : "mp4")) {
+      it.optimizedFile = tmp; it.optimizedTo = ext; it.optimizedRepair = true;
+      if (state.check) state.check.fixed++;
+    }
+    else { try { await fsp.unlink(tmp); } catch {} it.optimizeError = "Damaged audio that couldn't be repaired"; }
+  } catch (e) {
+    try { await fsp.unlink(tmp); } catch {}
+    it.optimizeError = String(e.message || e).slice(0, 160);
+  } finally { optChild = null; it.optimizing = false; it.repairing = false; it.checking = false; save(); }
+}
+// Files whose audio the check covers (MKV and others go through Stremio's converter, which skips damage).
+const checkable = (it) => it.status === "done" && /^(mp4|m4v|mov)$/.test(extOf(it.file));
+
 async function optimize(it) {
   const t = targetOf(it);
   const info = await inspect(it.file);
   if (TARGETS[t].smooth && info.direct && extOf(it.file) === t) { it.optimized = true; save(); return; }
   if (TARGETS[t].smooth && (!info.video || !PLAYABLE_VIDEO.includes(info.video.codec_name))) { it.optimized = "skipped"; save(); return; } // would still need converting
   const out = it.file.replace(/\.[^./\\]+$/, "") + "." + t;
-  const tmp = `${out}.${process.pid}.optimizing`; // per-run name: a leftover from a crashed run can't clash
+  let tmp = `${out}.${process.pid}.optimizing`; // per-run name: a leftover from a crashed run can't clash
   let args;
   if (TARGETS[t].smooth) {
     const audio = !info.audio ? ["-an"]
@@ -315,6 +368,14 @@ async function optimize(it) {
   try {
     await run(FF.ffmpeg, ["-hide_banner", "-nostdin", "-y", "-v", "error", "-i", it.file, ...args, "-f", TARGETS[t].mux, tmp], (p) => (optChild = p));
     if (TARGETS[t].smooth && !(await inspect(tmp)).direct) throw new Error("converted file still isn't directly playable");
+    if (TARGETS[t].smooth && (await audioErrors(tmp)) !== 0) {
+      const fixed = `${out}.${process.pid}0.optimizing`;
+      const ok = await repairAudio(tmp, fixed, TARGETS[t].mux);
+      try { await fsp.unlink(tmp); } catch {}
+      tmp = fixed;
+      if (!ok) throw new Error("the converted audio has errors");
+    }
+    if (TARGETS[t].smooth) it.audioChecked = true;
     it.optimizedFile = tmp; it.optimizedTo = t; // swapped in by swapOptimized() once nothing is reading the original
   } catch (e) {
     try { await fsp.unlink(tmp); } catch {}
@@ -338,7 +399,7 @@ async function swapOptimized(it) {
     it.originalType ||= extOf(old).toUpperCase(); // what it was downloaded as, kept through later conversions
     it.file = out; it.filename = path.basename(out); it.size = (await fsp.stat(out)).size; it.done = it.size;
     it.optimized = TARGETS[it.optimizedTo]?.smooth ? true : false; it.checked = true;
-    delete it.optimizedFile; delete it.optimizedTo; save();
+    delete it.optimizedFile; delete it.optimizedTo; delete it.optimizedRepair; save();
   } catch { return; }
   if (old !== out) try { await fsp.unlink(old); } catch { it.oldFile = old; save(); } // still locked: retried below
 }
@@ -365,13 +426,19 @@ async function optimizeTick() {
   for (const it of Object.values(state.items)) {
     if (it.oldFile) try { await fsp.unlink(it.oldFile); delete it.oldFile; save(); } catch (e) { if (e.code === "ENOENT") { delete it.oldFile; save(); } }
     // Converted, but they've since picked something else: throw that file away.
-    if (it.optimizedFile && targetOf(it) !== it.optimizedTo) { try { await fsp.unlink(it.optimizedFile); } catch {} delete it.optimizedFile; delete it.optimizedTo; save(); }
+    if (it.optimizedFile && !it.optimizedRepair && targetOf(it) !== it.optimizedTo) { try { await fsp.unlink(it.optimizedFile); } catch {} delete it.optimizedFile; delete it.optimizedTo; save(); }
     if (it.optimizedFile && it.status === "done") await swapOptimized(it);
   }
   if (optimizing) return;
   const next = Object.values(state.items).find((it) => it.status === "done" && !it.optimizedFile && needsWork(it) &&
     it.optimized !== "failed" && it.optimized !== "skipped" && fs.existsSync(it.file));
-  if (!next) return;
+  if (!next) {
+    const check = Object.values(state.items).find((it) => checkable(it) && !it.audioChecked && !it.optimizedFile && fs.existsSync(it.file));
+    if (!check) return;
+    optimizing = check.key;
+    try { await checkAudio(check); } finally { optimizing = null; }
+    return;
+  }
   optimizing = next.key;
   try { await optimize(next); } catch (e) { next.optimizing = false; next.optimized = "failed"; next.optimizeError = String(e.message || e).slice(0, 160); save(); }
   finally { optimizing = null; }
@@ -457,7 +524,8 @@ export async function handle(req, res, u, headers, origin) {
   if (p === "/dl/state" && req.method === "GET") {
     let free = null;
     if (state.folder) { try { const sf = await fsp.statfs(state.folder); free = sf.bavail * sf.bsize; } catch {} }
-    send(200, { folder: state.folder, free, autoDelete: state.autoDelete !== false, convertToMp4: state.convertToMp4 !== false, disabledTypes: state.disabledTypes || [], canConvert: !!FF, targets: FF ? Object.keys(TARGETS) : [], engineUp: await engineUp(), items: Object.values(state.items).sort((a, b) => a.addedAt - b.addedAt).map(publicItem) });
+    send(200, { folder: state.folder, free, autoDelete: state.autoDelete !== false, convertToMp4: state.convertToMp4 !== false, disabledTypes: state.disabledTypes || [], canConvert: !!FF, targets: FF ? Object.keys(TARGETS) : [],
+      check: state.check || null, checkPending: Object.values(state.items).filter((it) => checkable(it) && !it.audioChecked).length, engineUp: await engineUp(), items: Object.values(state.items).sort((a, b) => a.addedAt - b.addedAt).map(publicItem) });
     return true;
   }
   // Folder browser for the in-app folder picker (a Windows dialog can't appear over Stremio's
@@ -586,6 +654,15 @@ export async function handle(req, res, u, headers, origin) {
     if (it.keep && it.status === "watched" && fs.existsSync(it.file)) { it.status = "done"; it.watched = true; }
     save();
     send(200, publicItem(it));
+    return true;
+  }
+  if (p === "/dl/check") {
+    // "Check files" on the Downloads page: check every MP4/MOV file's audio again (repairs what's damaged).
+    const items = Object.values(state.items).filter(checkable);
+    for (const it of items) it.audioChecked = false;
+    state.check = { at: Date.now(), total: items.length, found: 0, fixed: 0 };
+    save();
+    send(200, { total: items.length });
     return true;
   }
   if (p === "/dl/format") {

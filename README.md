@@ -49,6 +49,8 @@ On the Downloads page you can also:
   types (like MKV) go through Stremio's own converter and can freeze for a few seconds.
 - Open **What do the file types and colours mean?** for a quick guide, and click a colour badge
   there to turn a file type off.
+- **Check files** looks for damaged audio in your MP4 downloads (it makes Stremio stop with
+  "Error occurred when decoding") and repairs it. Converted files are checked automatically.
 
 ## Updates
 

@@ -3,7 +3,7 @@
  * @description Download episodes ahead and watch them from your disk with no buffering. Needs the Strem+ helper (see GitHub).
  * @updateUrl https://raw.githubusercontent.com/BigBoy203/Strem_plus/main/stremio-enhanced/plugins/download-ahead.plugin.js
  * @source https://github.com/BigBoy203/Strem_plus
- * @version 1.2.1
+ * @version 1.2.2
  * @author BigBoy203
  */
 
@@ -232,6 +232,9 @@ div:has(> [class*="addon-name-"]):has(> .sib-side, > .da-sbtn){display:flex;flex
 .dp-switch i{position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:left .15s}
 .dp-switch.on{background:var(--primary-accent-color)}
 .dp-switch.on i{left:23px}
+.dp-pin{width:34px;height:34px;padding:0;flex:none;display:inline-flex;align-items:center;justify-content:center;border-radius:8px;font-size:15px}
+.dp-check{margin-top:4px;opacity:.75}
+.dp-check.fixed{color:#4ade80;opacity:1}
 .dp-keep.on{background:color-mix(in srgb,var(--primary-accent-color) 25%,transparent);color:color-mix(in srgb,var(--primary-accent-color) 55%,white)}
 .dp-tag{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:6px;font-size:11px;font-weight:700;background:rgba(74,222,128,.14);color:#4ade80;vertical-align:middle}
 .dp-tag.ft-conv{background:rgba(251,191,36,.14);color:#fbbf24}
@@ -328,6 +331,9 @@ div:has(> [class*="addon-name-"]):has(> .sib-side, > .da-sbtn){display:flex;flex
     pending: (it) => `Waiting to be converted to ${TYPE_NAMES[it.target] || "MP4"}`,
     failed: "Couldn't convert it, so it goes through Stremio's converter (may freeze briefly)",
     converter: "Goes through Stremio's converter (may freeze briefly)",
+    checking: "Checking the audio for damage...",
+    repairing: "Fixing a damaged bit of audio (the picture isn't touched)...",
+    repaired: "Audio fixed; switches over once you stop playing it",
   };
   const playbackText = (it) => { const p = PLAYBACK[it.playback] || PLAYBACK.converter; return typeof p === "function" ? p(it) : p; };
   // Colour by how well Stremio copes with the file type: green plays directly, yellow (MKV) goes
@@ -339,11 +345,12 @@ div:has(> [class*="addon-name-"]):has(> .sib-side, > .da-sbtn){display:flex;flex
   const isOff = (t) => (state.dl?.disabledTypes || []).includes(String(t || "").toLowerCase());
   function fileTag(it) {
     if (!it.fileType) return "";
-    const label = it.playback === "optimizing" ? `${it.fileType} → ${TYPE_NAMES[it.converting] || "MP4"}` : it.fileType;
+    const label = it.playback === "repairing" ? `${it.fileType} · fixing audio` : it.playback === "checking" ? `${it.fileType} · checking`
+      : it.playback === "optimizing" ? `${it.fileType} → ${TYPE_NAMES[it.converting] || "MP4"}` : it.fileType;
     return `<span class="dp-tag ${typeClass(it.fileType)}" title="${esc(playbackText(it) + (it.optimizeError ? ": " + it.optimizeError : ""))}">${esc(label)}</span>`;
   }
   // Converted files just say what they were downloaded as.
-  const playbackNote = (it) => (it.originalType && it.originalType !== it.fileType && !["optimizing", "swapping", "pending"].includes(it.playback)
+  const playbackNote = (it) => (it.originalType && it.originalType !== it.fileType && !["optimizing", "swapping", "pending", "checking", "repairing", "repaired"].includes(it.playback)
     ? `Original: ${it.originalType}` : playbackText(it));
 
   // Convert to MP4 on:  "Keep original (MKV)" until it's converted ("Convert to MP4" if kept).
@@ -966,6 +973,9 @@ div:has(> [class*="addon-name-"]):has(> .sib-side, > .da-sbtn){display:flex;flex
       const it = (state.dl?.items || []).find((i) => i.key === key);
       await api("/dl/keep", { key, keep: !it?.keep }).catch((er) => showNote(er.message));
     }
+    if (act === "check") {
+      await api("/dl/check", {}).catch((er) => showNote(er.message));
+    }
     if (act === "format") {
       await api("/dl/format", { key, format: el.dataset.format }).catch((er) => showNote(er.message));
     }
@@ -1005,6 +1015,15 @@ div:has(> [class*="addon-name-"]):has(> .sib-side, > .da-sbtn){display:flex;flex
     const ep = type === "series" && videoId && videoId !== metaId ? videoId : "";
     return `data-act="goto" data-type="${type}" data-gmeta="${esc(metaId)}" data-vid="${esc(ep)}" title="${ep ? "Go to this episode" : `Go to this ${type === "movie" ? "movie" : "show"}`}"`;
   }
+  // Result of the last "Check files" (shown for 10 minutes).
+  function checkSummary() {
+    const c = state.dl?.check, left = state.dl?.checkPending || 0;
+    if (!c || Date.now() - c.at > 10 * 60_000) return "";
+    const msg = left ? `Checking files: ${c.total - left} of ${c.total} done${c.fixed ? ` · fixed ${c.fixed}` : ""}`
+      : c.found ? `Check done: fixed ${c.fixed} of ${c.found} file${c.found > 1 ? "s" : ""} with damaged audio`
+      : `Check done: all ${c.total} file${c.total === 1 ? "" : "s"} are fine`;
+    return `<div class="dp-meta dp-check${!left && c.found ? " fixed" : ""}">${esc(msg)}</div>`;
+  }
   const eta = (it) => (it.speed > 0 && it.size ? Math.max(0, (it.size - it.done) / it.speed) : null);
   const fmtDur = (s) => { if (s == null) return ""; s = Math.round(s); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
     return h ? `${h}h ${m}m left` : m ? `${m}m left` : `${s}s left`; };
@@ -1020,14 +1039,17 @@ div:has(> [class*="addon-name-"]):has(> .sib-side, > .da-sbtn){display:flex;flex
     const ready = items.filter((i) => i.status === "done");
     const readyBytes = ready.reduce((a, i) => a + (i.size || 0), 0);
     const autoDel = state.dl?.autoDelete !== false;
-    const keepBtn = (it) => `<button class="da-btn ghost dp-sm dp-keep${it.keep ? " on" : ""}" data-act="keep" data-key="${it.key}"
+    const keepBtn = (it) => `<button class="da-btn ghost dp-pin dp-keep${it.keep ? " on" : ""}" data-act="keep" data-key="${it.key}"
       title="${it.keep ? "Kept: never deleted automatically. Click to stop keeping it." : "Keep this episode: never delete it automatically"}">📌</button>`;
 
     let h = `<div class="dp-card dp-folder">
       <div class="dp-fl"><div class="dp-lbl">Download folder</div><div class="dp-path">${state.dl?.folder ? esc(state.dl.folder) : "Not chosen yet"}</div>
-        <div class="dp-meta">${state.dl?.free != null ? bytes(state.dl.free) + " free" : ""}${ready.length ? ` · ${ready.length} ready (${bytes(readyBytes)})` : ""}${active.length ? ` · ${active.length} downloading` : ""}</div></div>
+        <div class="dp-meta">${state.dl?.free != null ? bytes(state.dl.free) + " free" : ""}${ready.length ? ` · ${ready.length} ready (${bytes(readyBytes)})` : ""}${active.length ? ` · ${active.length} downloading` : ""}</div>
+        ${checkSummary()}</div>
       <div class="dp-actions"><button class="da-btn" data-act="folder">${state.dl?.folder ? "Change folder" : "Choose folder"}</button>
-        ${state.dl?.folder ? `<button class="da-btn ghost" data-act="open">Open in Explorer</button>` : ""}</div>
+        ${state.dl?.folder ? `<button class="da-btn ghost" data-act="open">Open in Explorer</button>` : ""}
+        ${state.dl?.canConvert ? `<button class="da-btn ghost" data-act="check" ${state.dl?.check && state.dl?.checkPending ? "disabled" : ""}
+          title="Checks your MP4 and MOV downloads for damaged audio (which makes Stremio stop with 'Error occurred when decoding') and repairs it">${state.dl?.check && state.dl?.checkPending ? "Checking..." : "Check files"}</button>` : ""}</div>
       <div class="dp-toggle-row" data-act="autodel">
         <div class="dp-switch${autoDel ? " on" : ""}"><i></i></div>
         <div><div class="dp-ep-t">Delete after watching</div>
@@ -1073,14 +1095,13 @@ div:has(> [class*="addon-name-"]):has(> .sib-side, > .da-sbtn){display:flex;flex
         }
         for (const [s, eps] of seasons) {
           if (s != null) h += `<div class="dp-season">Season ${s}</div>`;
-          h += eps.map((it) => `<div class="dp-ep"><div class="dp-main"><div class="dp-ep-t"><span class="dp-link" ${gotoAttrs(it.type, gMeta, it.videoId)}>${esc(it.title.replace(g.name, "").trim() || it.title)}</span>${fileTag(it)}${it.watched ? ` <span class="dp-tag">Watched</span>` : ""}</div>
+          h += eps.map((it) => `<div class="dp-ep">${keepBtn(it)}<div class="dp-main"><div class="dp-ep-t"><span class="dp-link" ${gotoAttrs(it.type, gMeta, it.videoId)}>${esc(it.title.replace(g.name, "").trim() || it.title)}</span>${fileTag(it)}${it.watched ? ` <span class="dp-tag">Watched</span>` : ""}</div>
             <div class="dp-rel" title="${esc(it.release || it.filename)}">${esc(it.quality ? it.quality + " · " : "")}${bytes(it.size)} · downloaded ${new Date(it.finishedAt || it.addedAt).toLocaleDateString()}</div>
             <div class="dp-meta">${esc(playbackNote(it))}</div></div>
             ${formatBtn(it)}
             ${isOff(it.fileType) ? `<button class="da-btn" disabled title="${esc(it.fileType)} is turned off. Turn it back on in the file types guide, or convert this file.">▶ Play</button>`
               : `<button class="da-btn" data-act="play" data-key="${it.key}">▶ Play</button>`}
             <button class="da-btn ghost dp-sm" data-act="open" data-key="${it.key}" title="Show in Explorer">📂</button>
-            ${keepBtn(it)}
             <button class="da-x${state.confirmKey === it.key ? " sure" : ""}" data-act="remove" data-key="${it.key}" title="Delete">${state.confirmKey === it.key ? "Delete?" : "✕"}</button></div>`).join("");
         }
         h += `</div>`;
@@ -1090,7 +1111,6 @@ div:has(> [class*="addon-name-"]):has(> .sib-side, > .da-sbtn){display:flex;flex
     if (!active.length && !ready.length) {
       h += `<div class="dp-card dp-empty">Nothing downloaded yet.<br><span class="dp-meta">Use the download button on an episode, on a stream in the stream list, or in the player.</span></div>`;
     }
-    h += `<div class="dp-foot">${autoDel ? `Episodes are deleted automatically after you watch ${Math.round(WATCHED_AT * 100)}% of them, except ones you keep (📌).` : "Delete after watching is off, so episodes stay until you delete them."} Downloads use Stremio's torrent engine, so they only run while Stremio is open and resume where they stopped.</div>`;
 
     body.innerHTML = h;
     body.scrollTop = keep;
